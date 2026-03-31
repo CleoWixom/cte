@@ -1,0 +1,17 @@
+[package]
+name = "trieval-core"
+version.workspace = true
+edition.workspace = true
+description = "Core math for cell triangulation: IDW, Kriging, LM, Monte Carlo"
+
+[lib]
+name = "trieval_core"
+
+[dependencies]
+nalgebra = { version = "0.32", default-features = false, features = ["alloc"] }
+libm = "0.2"
+serde = { workspace = true }
+
+[features]
+default = ["std"]
+std = []

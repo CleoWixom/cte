@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    branches: [main, master]
+    # Only trigger when relevant files change (not docs-only pushes)
+    paths:
+      - "crates/**"
+      - "web/src/**"
+      - "migrations/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: write   # needed to push tags & create releases
+
+jobs:
+  release:
+    name: Auto-version & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history for commit counting
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 1. Determine next version ────────────────────────────────────────
+      - name: Compute next version
+        id: version
+        run: |
+          # Strategy: semantic auto-bump from conventional commit prefixes.
+          # feat!: / BREAKING CHANGE → MAJOR bump
+          # feat:  → MINOR bump
+          # fix: / perf: / refactor: / anything else → PATCH bump
+
+          LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ -z "$LATEST" ]; then
+            LATEST="v0.0.0"
+          fi
+          echo "Latest tag: $LATEST"
+
+          MAJOR=$(echo $LATEST | cut -d. -f1 | tr -d 'v')
+          MINOR=$(echo $LATEST | cut -d. -f2)
+          PATCH=$(echo $LATEST | cut -d. -f3)
+
+          # Commits since last tag
+          if [ "$LATEST" = "v0.0.0" ]; then
+            COMMITS=$(git log --oneline --pretty=format:"%s")
+          else
+            COMMITS=$(git log ${LATEST}..HEAD --oneline --pretty=format:"%s")
+          fi
+
+          echo "Commits since $LATEST:"
+          echo "$COMMITS"
+
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qE '^feat!:|BREAKING CHANGE'; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qE '^feat(\(.+\))?:'; then
+            BUMP="minor"
+          fi
+
+          case $BUMP in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "bump=$BUMP" >> $GITHUB_OUTPUT
+          echo "Next version: $NEW_VERSION (${BUMP} bump)"
+
+      # ── 2. Update version in Cargo.toml files ────────────────────────────
+      - name: Patch Cargo.toml versions
+        run: |
+          VERSION="${{ steps.version.outputs.new_version }}"
+          BARE="${VERSION#v}"
+          # Workspace version
+          sed -i "s/^version = \"[0-9]*\.[0-9]*\.[0-9]*\"/version = \"$BARE\"/" Cargo.toml
+          echo "Patched Cargo.toml to $BARE"
+
+      # ── 3. Build server binary ────────────────────────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server (release)
+        run: cargo build --release -p trieval-server
+
+      - name: Package server binary
+        run: |
+          mkdir -p dist-release
+          cp target/release/server dist-release/trieval-server-linux-x86_64
+          tar -czf dist-release/trieval-server-linux-x86_64.tar.gz \
+            -C dist-release trieval-server-linux-x86_64 \
+            migrations/ .env.example docker-compose.yml
+
+      # ── 4. Build WASM ─────────────────────────────────────────────────────
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build WASM
+        run: |
+          wasm-pack build crates/wasm --target web \
+            --out-dir ../../web/src/wasm --release || echo "WASM build skipped (missing deps)"
+
+      # ── 5. Build frontend ─────────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend
+        run: |
+          cd web
+          npm install
+          npm run build || echo "Frontend build skipped"
+          if [ -d dist ]; then
+            tar -czf ../dist-release/trieval-web.tar.gz dist/
+          fi
+
+      # ── 6. Generate changelog ─────────────────────────────────────────────
+      - name: Generate changelog
+        id: changelog
+        run: |
+          LATEST=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ -z "$LATEST" ] || [ "$LATEST" = "v0.0.0" ]; then
+            LOG=$(git log --oneline -20 --pretty=format:"- %s (%h)")
+          else
+            LOG=$(git log ${LATEST}..HEAD --oneline --pretty=format:"- %s (%h)")
+          fi
+          if [ -z "$LOG" ]; then
+            LOG="- Minor updates and improvements"
+          fi
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$LOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # ── 7. Commit bumped version, tag, push ───────────────────────────────
+      - name: Commit version bump
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git diff --cached --quiet || git commit -m "chore: bump version to ${{ steps.version.outputs.new_version }} [skip ci]"
+          git tag ${{ steps.version.outputs.new_version }}
+          git push origin HEAD
+          git push origin ${{ steps.version.outputs.new_version }}
+
+      # ── 8. Create GitHub Release ──────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new_version }}
+          name: "Release ${{ steps.version.outputs.new_version }}"
+          body: |
+            ## What's Changed
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ---
+            **Bump type:** `${{ steps.version.outputs.bump }}`
+
+            ### Assets
+            - `trieval-server-linux-x86_64.tar.gz` — server binary + migrations + docker-compose
+            - `trieval-web.tar.gz` — pre-built frontend (untar to serve as static files)
+
+            ### Conventional Commits
+            Use these prefixes to control version bumping:
+            - `feat!:` / `BREAKING CHANGE` → **major** bump
+            - `feat:` → **minor** bump
+            - `fix:`, `perf:`, `refactor:`, `chore:` → **patch** bump
+          files: |
+            dist-release/trieval-server-linux-x86_64.tar.gz
+            dist-release/trieval-web.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
