@@ -25,7 +25,7 @@ pub struct AreaQuery {
 
 fn default_radius() -> f64 { 1000.0 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CellsResponse {
     pub towers: Vec<CellTower>,
     pub measurements_count: i64,

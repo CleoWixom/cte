@@ -116,17 +116,19 @@ jobs:
       - name: Build WASM
         run: |
           wasm-pack build crates/wasm --target web \
-            --out-dir ../../web/src/wasm --release || echo "WASM build skipped (missing deps)"
+            --out-dir ../../web/public/wasm --release || echo "WASM build skipped (missing deps)"
 
       # ── 5. Build frontend ─────────────────────────────────────────────────
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
 
       - name: Build frontend
         run: |
           cd web
-          npm install
+          npm ci
           npm run build || echo "Frontend build skipped"
           if [ -d dist ]; then
             tar -czf ../dist-release/trieval-web.tar.gz dist/

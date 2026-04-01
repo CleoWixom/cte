@@ -66,13 +66,13 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM
-        run: wasm-pack build crates/wasm --target web --out-dir ../../web/src/wasm --release
+        run: wasm-pack build crates/wasm --target web --out-dir ../../web/public/wasm --release
 
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:
           name: trieval-wasm
-          path: web/src/wasm/
+          path: web/public/wasm/
           retention-days: 7
 
   # ── Frontend build ────────────────────────────────────────────────────────
@@ -87,15 +87,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: trieval-wasm
-          path: web/src/wasm/
+          path: web/public/wasm/
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
 
       - name: Install deps
         working-directory: web
-        run: npm install
+        run: npm ci
 
       - name: Build
         working-directory: web

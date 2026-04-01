@@ -166,7 +166,7 @@ pub fn empirical_variogram(
     max_dist_m: f64,
 ) -> (Vec<f64>, Vec<f64>, Vec<usize>) {
     let lag_width = max_dist_m / n_lags as f64;
-    let mut lags: Vec<f64> = (0..n_lags).map(|i| (i as f64 + 0.5) * lag_width).collect();
+    let bin_centers: Vec<f64> = (0..n_lags).map(|i| (i as f64 + 0.5) * lag_width).collect();
     let mut gamma_sum = vec![0.0_f64; n_lags];
     let mut counts = vec![0usize; n_lags];
 
@@ -191,7 +191,7 @@ pub fn empirical_variogram(
 
     for i in 0..n_lags {
         if counts[i] > 0 {
-            result_lags.push(lags[i]);
+            result_lags.push(bin_centers[i]);
             result_gamma.push(gamma_sum[i] / (2.0 * counts[i] as f64));
             result_counts.push(counts[i]);
         }

@@ -5,7 +5,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
 

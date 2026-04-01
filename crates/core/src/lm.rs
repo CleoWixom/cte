@@ -1,7 +1,6 @@
 /// Levenberg-Marquardt non-linear least squares for cell triangulation.
 /// Finds device position (lat, lon) that best explains observed RSSI values.
 
-use crate::geo::haversine_m;
 use crate::spatial::SpatialModel;
 use alloc::vec::Vec;
 
