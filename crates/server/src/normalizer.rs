@@ -1,4 +1,4 @@
-/// Normalizes various CSV/JSON source formats into our internal representation.
+//! Normalizes various CSV/JSON source formats into our internal representation.
 
 use trieval_core::signal::{normalize_to_dbm, RadioType};
 
@@ -15,8 +15,8 @@ pub struct NormalizedRecord {
 }
 
 /// Parse a CSV row from OpenCelliD measurements dump.
-/// Format: `radio,mcc,mnc,lac,cellid,unit,lon,lat,signal,ta,measured_at,rating,speed,direction`
-pub fn parse_oci_csv_row(record: &csv_async::StringRecord) -> Option<NormalizedRecord> {
+/// Format: `radio,mcc,mnc,lac,cellid,unit,lon,lat,signal,...`
+pub fn parse_oci_csv_row(record: &csv::StringRecord) -> Option<NormalizedRecord> {
     let radio = record.get(0)?.to_uppercase();
     let mcc: i16 = record.get(1)?.parse().ok()?;
     let mnc: i16 = record.get(2)?.parse().ok()?;
@@ -24,16 +24,10 @@ pub fn parse_oci_csv_row(record: &csv_async::StringRecord) -> Option<NormalizedR
     let cid: i64 = record.get(4)?.parse().ok()?;
     let lon: f64 = record.get(6)?.parse().ok()?;
     let lat: f64 = record.get(7)?.parse().ok()?;
-    let raw_signal: i16 = record.get(8)?.parse().ok()?;
+    let raw_signal: i16 = record.get(8)?.parse().unwrap_or(0);
 
-    // Validate coordinates
-    if lat.abs() > 90.0 || lon.abs() > 180.0 {
-        return None;
-    }
-    // Skip clearly invalid cells
-    if cid == 0 || lac == 0 {
-        return None;
-    }
+    if lat.abs() > 90.0 || lon.abs() > 180.0 { return None; }
+    if cid == 0 || lac == 0 { return None; }
 
     let radio_type = RadioType::from_str(&radio);
     let signal_dbm = if raw_signal != 0 {
@@ -43,19 +37,13 @@ pub fn parse_oci_csv_row(record: &csv_async::StringRecord) -> Option<NormalizedR
     };
 
     Some(NormalizedRecord {
-        radio,
-        mcc,
-        mnc,
-        lac,
-        cid,
-        lat,
-        lon,
+        radio, mcc, mnc, lac, cid, lat, lon,
         signal_dbm,
         raw_signal: if raw_signal != 0 { Some(raw_signal) } else { None },
     })
 }
 
-/// Parse Android WebSocket measurement JSON.
+/// Parse an Android WebSocket cell JSON value.
 pub fn parse_android_cell(value: &serde_json::Value) -> Option<NormalizedRecord> {
     let radio = value.get("radio")?.as_str()?.to_uppercase();
     let mcc: i16 = value.get("mcc")?.as_i64()? as i16;
@@ -70,13 +58,7 @@ pub fn parse_android_cell(value: &serde_json::Value) -> Option<NormalizedRecord>
     let signal_dbm = Some(normalize_to_dbm(rssi, radio_type));
 
     Some(NormalizedRecord {
-        radio,
-        mcc,
-        mnc,
-        lac,
-        cid,
-        lat,
-        lon,
+        radio, mcc, mnc, lac, cid, lat, lon,
         signal_dbm,
         raw_signal: Some(rssi),
     })

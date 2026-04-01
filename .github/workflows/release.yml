@@ -101,7 +101,7 @@ jobs:
       - name: Package server binary
         run: |
           mkdir -p dist-release
-          cp target/release/server dist-release/trieval-server-linux-x86_64
+          cp target/release/server dist-release/trieval-server-linux-x86_64 2>/dev/null || cp target/release/trieval-server dist-release/trieval-server-linux-x86_64
           tar -czf dist-release/trieval-server-linux-x86_64.tar.gz \
             -C dist-release trieval-server-linux-x86_64 \
             migrations/ .env.example docker-compose.yml

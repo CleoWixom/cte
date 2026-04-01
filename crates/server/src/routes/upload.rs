@@ -5,7 +5,6 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 
 use crate::{
     db::{insert_measurements, upsert_tower},
@@ -31,14 +30,11 @@ pub async fn upload_handler(
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("multipart error: {e}"))
     })? {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "source" => {
-                source = field.text().await.unwrap_or_default();
-            }
+        match field.name().unwrap_or("") {
+            "source" => { source = field.text().await.unwrap_or_default(); }
             "file" => {
                 csv_bytes = Some(field.bytes().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("file read error: {e}"))
+                    (StatusCode::BAD_REQUEST, format!("file read: {e}"))
                 })?);
             }
             _ => {}
@@ -47,22 +43,38 @@ pub async fn upload_handler(
 
     let bytes = csv_bytes.ok_or((StatusCode::BAD_REQUEST, "no file field".into()))?;
 
+    // Parse CSV synchronously in a blocking thread so we don't stall the runtime
+    let source_c = source.clone();
+    let state_c = Arc::clone(&state);
+    let (imported_towers, imported_measurements, skipped) =
+        tokio::task::spawn_blocking(move || {
+            parse_and_insert_sync(bytes, source_c, state_c)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?;
+
+    Ok(Json(UploadResponse { imported_towers, imported_measurements, skipped, source }))
+}
+
+/// Synchronous CSV parse + DB insert (runs in spawn_blocking).
+fn parse_and_insert_sync(
+    bytes: bytes::Bytes,
+    source: String,
+    state: Arc<AppState>,
+) -> (u64, u64, u64) {
+    let rt = tokio::runtime::Handle::current();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(bytes.as_ref());
+
     let mut imported_towers = 0u64;
     let mut imported_measurements = 0u64;
     let mut skipped = 0u64;
-
-    // Parse CSV (OCI format)
-    let cursor = std::io::Cursor::new(bytes.as_ref());
-    let mut rdr = csv_async::AsyncReader::from_reader(tokio::io::BufReader::new(
-        tokio_util::io::SyncIoBridge::new(cursor),
-    ));
-
-    let mut records = rdr.records();
     let mut batch: Vec<(i64, f64, f64, Option<i16>, Option<i16>, String, String)> = Vec::new();
 
-    use futures::StreamExt;
-    while let Some(record) = records.next().await {
-        let record = match record {
+    for result in rdr.records() {
+        let record = match result {
             Ok(r) => r,
             Err(_) => { skipped += 1; continue; }
         };
@@ -72,64 +84,40 @@ pub async fn upload_handler(
             None => { skipped += 1; continue; }
         };
 
-        // Upsert tower
-        match upsert_tower(
+        match rt.block_on(upsert_tower(
             &state.db,
-            &norm.radio,
-            norm.mcc,
-            norm.mnc,
-            norm.lac,
-            norm.cid,
-            norm.lat,
-            norm.lon,
-            None,
-            None,
-        )
-        .await
-        {
+            &norm.radio, norm.mcc, norm.mnc, norm.lac, norm.cid,
+            norm.lat, norm.lon, None, None,
+        )) {
             Ok(tower_id) => {
                 imported_towers += 1;
                 if norm.signal_dbm.is_some() {
                     batch.push((
-                        tower_id,
-                        norm.lat,
-                        norm.lon,
-                        norm.signal_dbm,
-                        norm.raw_signal,
-                        source.clone(),
-                        norm.radio.clone(),
+                        tower_id, norm.lat, norm.lon,
+                        norm.signal_dbm, norm.raw_signal,
+                        source.clone(), norm.radio.clone(),
                     ));
                 }
-
-                // Flush batch
                 if batch.len() >= 1000 {
-                    let refs: Vec<_> = batch.iter().map(|(a, b, c, d, e, f, g)| {
-                        (*a, *b, *c, *d, *e, f.as_str(), g.as_str())
-                    }).collect();
-                    imported_measurements += insert_measurements(&state.db, &refs)
-                        .await
+                    let refs: Vec<_> = batch.iter()
+                        .map(|(a,b,c,d,e,f,g)| (*a,*b,*c,*d,*e,f.as_str(),g.as_str()))
+                        .collect();
+                    imported_measurements += rt.block_on(insert_measurements(&state.db, &refs))
                         .unwrap_or(0);
                     batch.clear();
                 }
             }
-            Err(_) => skipped += 1,
+            Err(_) => { skipped += 1; }
         }
     }
 
-    // Flush remaining
     if !batch.is_empty() {
-        let refs: Vec<_> = batch.iter().map(|(a, b, c, d, e, f, g)| {
-            (*a, *b, *c, *d, *e, f.as_str(), g.as_str())
-        }).collect();
-        imported_measurements += insert_measurements(&state.db, &refs)
-            .await
+        let refs: Vec<_> = batch.iter()
+            .map(|(a,b,c,d,e,f,g)| (*a,*b,*c,*d,*e,f.as_str(),g.as_str()))
+            .collect();
+        imported_measurements += rt.block_on(insert_measurements(&state.db, &refs))
             .unwrap_or(0);
     }
 
-    Ok(Json(UploadResponse {
-        imported_towers,
-        imported_measurements,
-        skipped,
-        source,
-    }))
+    (imported_towers, imported_measurements, skipped)
 }

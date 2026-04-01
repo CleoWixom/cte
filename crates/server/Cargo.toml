@@ -11,24 +11,29 @@ path = "src/main.rs"
 [dependencies]
 trieval-core = { path = "../core", features = ["std"] }
 
-axum = { version = "0.7", features = ["ws", "multipart"] }
-tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+axum          = { version = "0.7", features = ["ws", "multipart"] }
+tokio         = { version = "1",   features = ["full"] }
+tower-http    = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
 
+# sqlx WITHOUT compile-time macros → no need for DATABASE_URL at compile time
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate", "uuid", "chrono"] }
 
-reqwest = { version = "0.12", features = ["json", "gzip"] }
-redis = { version = "0.25", features = ["tokio-comp"] }
+reqwest   = { version = "0.12", features = ["json", "gzip"] }
+redis     = { version = "0.25", features = ["tokio-comp"] }
 
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
-tracing = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+uuid    = { version = "1", features = ["v4"] }
+chrono  = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
-csv-async = { version = "1", features = ["tokio"] }
-tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
+
+# csv reading — sync reader wrapped in spawn_blocking
+csv = "1"
+
+bytes       = "1"
+tokio-util  = { version = "0.7", features = ["io"] }

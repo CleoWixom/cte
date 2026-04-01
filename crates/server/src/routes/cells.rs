@@ -3,12 +3,14 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    db::{get_measurements_in_radius, get_towers_in_radius, upsert_tower, CellMeasurement, CellTower},
+    db::{
+        count_measurements_in_radius, get_measurements_in_radius, get_towers_in_radius,
+        upsert_tower, CellMeasurement, CellTower,
+    },
     opencellid::fetch_towers_in_area,
     state::AppState,
 };
@@ -19,17 +21,14 @@ pub struct AreaQuery {
     pub lon: f64,
     #[serde(default = "default_radius")]
     pub radius_m: f64,
-    pub cell_id: Option<i64>,
 }
 
-fn default_radius() -> f64 {
-    1000.0
-}
+fn default_radius() -> f64 { 1000.0 }
 
 #[derive(Serialize)]
 pub struct CellsResponse {
     pub towers: Vec<CellTower>,
-    pub measurements_count: usize,
+    pub measurements_count: i64,
     pub source: String,
 }
 
@@ -43,10 +42,11 @@ pub async fn cells_handler(
     Query(q): Query<AreaQuery>,
 ) -> Result<Json<CellsResponse>, StatusCode> {
     let radius = q.radius_m.clamp(100.0, 5000.0);
-
-    // 1. Check Redis cache
     let cache_key = format!("cells:{:.4}:{:.4}:{:.0}", q.lat, q.lon, radius);
+
+    // 1. Redis cache
     if let Ok(mut conn) = state.redis.get_multiplexed_async_connection().await {
+        use redis::AsyncCommands;
         if let Ok(cached) = conn.get::<_, String>(&cache_key).await {
             if let Ok(resp) = serde_json::from_str::<CellsResponse>(&cached) {
                 return Ok(Json(resp));
@@ -54,64 +54,35 @@ pub async fn cells_handler(
         }
     }
 
-    // 2. Query DB
+    // 2. DB
     let towers = get_towers_in_radius(&state.db, q.lat, q.lon, radius)
         .await
-        .map_err(|e| {
-            tracing::error!("DB error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(|e| { tracing::error!("DB: {e}"); StatusCode::INTERNAL_SERVER_ERROR })?;
 
     let (towers, source) = if towers.len() < 3 && !state.oci_key.is_empty() {
-        // 3. Fetch from OCI API and save
+        // 3. Fallback to OCI API
         match fetch_towers_in_area(&state.http, &state.oci_key, q.lat, q.lon, radius).await {
-            Ok(oci_towers) => {
-                for t in &oci_towers {
-                    let _ = upsert_tower(
-                        &state.db,
-                        &t.radio,
-                        t.mcc,
-                        t.mnc,
-                        t.lac,
-                        t.cid,
-                        t.lat,
-                        t.lon,
-                        t.range,
-                        t.samples,
-                    )
-                    .await;
+            Ok(oci) => {
+                for t in &oci {
+                    let _ = upsert_tower(&state.db, &t.radio, t.mcc, t.mnc, t.lac, t.cid,
+                                        t.lat, t.lon, t.range, t.samples).await;
                 }
-                // Re-fetch from DB with proper types
                 let fresh = get_towers_in_radius(&state.db, q.lat, q.lon, radius)
-                    .await
-                    .unwrap_or_default();
+                    .await.unwrap_or_default();
                 (fresh, "api".to_string())
             }
-            Err(e) => {
-                tracing::warn!("OCI API error: {e}");
-                (towers, "db".to_string())
-            }
+            Err(e) => { tracing::warn!("OCI: {e}"); (towers, "db".to_string()) }
         }
     } else {
         (towers, "db".to_string())
     };
 
-    // Get measurement count for area
-    let measurements_count = sqlx::query_scalar!(
-        "SELECT COUNT(*) FROM measurements m
-         JOIN cell_towers t ON t.id = m.cell_id
-         WHERE ST_DWithin(t.geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, $3)",
-        q.lat, q.lon, radius,
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(Some(0))
-    .unwrap_or(0) as usize;
-
+    let measurements_count = count_measurements_in_radius(&state.db, q.lat, q.lon, radius).await;
     let resp = CellsResponse { towers, measurements_count, source };
 
-    // Cache for 1 hour
+    // Cache 1 hour
     if let Ok(mut conn) = state.redis.get_multiplexed_async_connection().await {
+        use redis::AsyncCommands;
         if let Ok(json) = serde_json::to_string(&resp) {
             let _: Result<(), _> = conn.set_ex(&cache_key, json, 3600).await;
         }
@@ -128,6 +99,5 @@ pub async fn measurements_handler(
     let measurements = get_measurements_in_radius(&state.db, q.lat, q.lon, radius)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
     Ok(Json(MeasurementsResponse { measurements }))
 }

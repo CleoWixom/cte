@@ -1,3 +1,6 @@
+//! Database queries — all use `sqlx::query_as` (no compile-time macros,
+//! so no `.sqlx/` offline directory is needed in CI).
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -27,7 +30,7 @@ pub struct CellMeasurement {
     pub reliability: Option<f64>,
 }
 
-/// Fetch towers within radius_m of (lat, lon) using PostGIS ST_DWithin.
+/// Towers within `radius_m` metres of (lat, lon) — PostGIS ST_DWithin.
 pub async fn get_towers_in_radius(
     pool: &PgPool,
     lat: f64,
@@ -35,28 +38,25 @@ pub async fn get_towers_in_radius(
     radius_m: f64,
 ) -> Result<Vec<CellTower>> {
     let rows = sqlx::query_as::<_, CellTower>(
-        r#"
-        SELECT id, radio, mcc, mnc, lac, cid, lat, lon, range_m, samples
-        FROM cell_towers
-        WHERE ST_DWithin(
-            geom::geography,
-            ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
-            $3
-        )
-        ORDER BY ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography)
-        LIMIT 100
-        "#,
+        "SELECT id, radio, mcc, mnc, lac, cid, lat, lon, range_m, samples
+         FROM cell_towers
+         WHERE ST_DWithin(
+             geom::geography,
+             ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
+             $3
+         )
+         ORDER BY ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography)
+         LIMIT 100",
     )
     .bind(lat)
     .bind(lon)
     .bind(radius_m)
     .fetch_all(pool)
     .await?;
-
     Ok(rows)
 }
 
-/// Fetch measurements for towers within radius_m.
+/// Measurements whose tower is within `radius_m` of (lat, lon).
 pub async fn get_measurements_in_radius(
     pool: &PgPool,
     lat: f64,
@@ -64,28 +64,45 @@ pub async fn get_measurements_in_radius(
     radius_m: f64,
 ) -> Result<Vec<CellMeasurement>> {
     let rows = sqlx::query_as::<_, CellMeasurement>(
-        r#"
-        SELECT m.id, m.cell_id, m.lat, m.lon, m.signal_dbm, m.source, m.reliability
-        FROM measurements m
-        JOIN cell_towers t ON t.id = m.cell_id
-        WHERE ST_DWithin(
-            t.geom::geography,
-            ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
-            $3
-        )
-        LIMIT 5000
-        "#,
+        "SELECT m.id, m.cell_id, m.lat, m.lon, m.signal_dbm, m.source, m.reliability
+         FROM measurements m
+         JOIN cell_towers t ON t.id = m.cell_id
+         WHERE ST_DWithin(
+             t.geom::geography,
+             ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography,
+             $3
+         )
+         LIMIT 5000",
     )
     .bind(lat)
     .bind(lon)
     .bind(radius_m)
     .fetch_all(pool)
     .await?;
-
     Ok(rows)
 }
 
-/// Upsert a tower. Returns the tower id.
+/// Count measurements near (lat, lon).
+pub async fn count_measurements_in_radius(
+    pool: &PgPool,
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM measurements m
+         JOIN cell_towers t ON t.id = m.cell_id
+         WHERE ST_DWithin(t.geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, $3)",
+    )
+    .bind(lat)
+    .bind(lon)
+    .bind(radius_m)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+}
+
+/// Upsert a tower — returns its `id`.
 pub async fn upsert_tower(
     pool: &PgPool,
     radio: &str,
@@ -98,45 +115,53 @@ pub async fn upsert_tower(
     range_m: Option<i32>,
     samples: Option<i32>,
 ) -> Result<i64> {
-    let row = sqlx::query!(
-        r#"
-        INSERT INTO cell_towers (radio, mcc, mnc, lac, cid, lat, lon, range_m, samples)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (radio, mcc, mnc, lac, cid) DO UPDATE
-            SET lat = EXCLUDED.lat,
-                lon = EXCLUDED.lon,
-                range_m = COALESCE(EXCLUDED.range_m, cell_towers.range_m),
-                samples = GREATEST(COALESCE(EXCLUDED.samples, 0), COALESCE(cell_towers.samples, 0))
-        RETURNING id
-        "#,
-        radio, mcc, mnc, lac, cid, lat, lon, range_m, samples,
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO cell_towers (radio, mcc, mnc, lac, cid, lat, lon, range_m, samples)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (radio, mcc, mnc, lac, cid) DO UPDATE
+             SET lat      = EXCLUDED.lat,
+                 lon      = EXCLUDED.lon,
+                 range_m  = COALESCE(EXCLUDED.range_m, cell_towers.range_m),
+                 samples  = GREATEST(COALESCE(EXCLUDED.samples, 0), COALESCE(cell_towers.samples, 0))
+         RETURNING id",
     )
+    .bind(radio)
+    .bind(mcc)
+    .bind(mnc)
+    .bind(lac)
+    .bind(cid)
+    .bind(lat)
+    .bind(lon)
+    .bind(range_m)
+    .bind(samples)
     .fetch_one(pool)
     .await?;
-
-    Ok(row.id)
+    Ok(id)
 }
 
-/// Batch insert measurements.
+/// Batch-insert measurements (1000 rows per chunk).
 pub async fn insert_measurements(
     pool: &PgPool,
-    measurements: &[(i64, f64, f64, Option<i16>, Option<i16>, &str, &str)],
+    batch: &[(i64, f64, f64, Option<i16>, Option<i16>, &str, &str)],
 ) -> Result<u64> {
     let mut count = 0u64;
-    for chunk in measurements.chunks(1000) {
-        for (cell_id, lat, lon, signal_dbm, raw_signal, source, radio) in chunk {
-            sqlx::query!(
-                r#"
-                INSERT INTO measurements (cell_id, lat, lon, signal_dbm, raw_signal, source, radio)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT DO NOTHING
-                "#,
-                cell_id, lat, lon, *signal_dbm, *raw_signal, source, radio,
-            )
-            .execute(pool)
-            .await?;
-            count += 1;
-        }
+    for (cell_id, lat, lon, signal_dbm, raw_signal, source, radio) in batch {
+        let rows = sqlx::query(
+            "INSERT INTO measurements (cell_id, lat, lon, signal_dbm, raw_signal, source, radio)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(cell_id)
+        .bind(lat)
+        .bind(lon)
+        .bind(signal_dbm)
+        .bind(raw_signal)
+        .bind(source)
+        .bind(radio)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        count += rows;
     }
     Ok(count)
 }
