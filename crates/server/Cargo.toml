@@ -13,7 +13,7 @@ trieval-core = { path = "../core", features = ["std"] }
 
 axum          = { version = "0.7", features = ["ws", "multipart"] }
 tokio         = { version = "1",   features = ["full"] }
-tower-http    = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+tower-http    = { version = "0.5", features = ["cors", "trace", "compression-gzip", "fs"] }
 
 # sqlx WITHOUT compile-time macros → no need for DATABASE_URL at compile time
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate", "uuid", "chrono"] }

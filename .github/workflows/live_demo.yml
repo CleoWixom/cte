@@ -1,0 +1,286 @@
+name: 🗺️ Live Demo
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Собирает trieval (server + WASM + frontend), поднимает Postgres+PostGIS,
+# Redis, запускает сервер и пробрасывает его наружу через выбранный туннель.
+#
+# URL выводится крупно в логах и в Step Summary — сразу открывай в браузере.
+# Туннель живёт N минут, потом сам останавливается.
+# Прервать досрочно: Actions → этот запуск → Cancel workflow.
+#
+# Секреты (Settings → Secrets → Actions):
+#   NGROK_AUTHTOKEN — только для tunnel: ngrok
+#   OPENCELLID_KEY  — опционально, для подтягивания башен с OCI API
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel:
+        description: "Туннель"
+        required: true
+        default: "localtunnel"
+        type: choice
+        options:
+          - localtunnel
+          - cloudflared
+          - ngrok
+      port:
+        description: "Порт сервера"
+        required: false
+        default: "8080"
+      duration:
+        description: "Сколько держать живым (минуты)"
+        required: false
+        default: "30"
+      opencellid_key:
+        description: "OpenCelliD API key (опционально)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  PORT:     ${{ github.event.inputs.port     || '8080' }}
+  TUNNEL:   ${{ github.event.inputs.tunnel   || 'localtunnel' }}
+  DURATION: ${{ github.event.inputs.duration || '30' }}
+  DATABASE_URL: postgres://trieval:trieval@localhost:5432/trieval
+  REDIS_URL:    redis://127.0.0.1:6379
+  OPENCELLID_KEY: ${{ github.event.inputs.opencellid_key || secrets.OPENCELLID_KEY || '' }}
+
+jobs:
+  demo:
+    name: "Demo via ${{ github.event.inputs.tunnel || 'localtunnel' }}"
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4-alpine
+        env:
+          POSTGRES_DB:       trieval
+          POSTGRES_USER:     trieval
+          POSTGRES_PASSWORD: trieval
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U trieval"
+          --health-interval 5s --health-timeout 5s --health-retries 15
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Rust + cache ────────────────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: demo-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: demo-cargo-
+
+      # ── Build server ─────────────────────────────────────────────────────────
+      - name: Build server
+        run: cargo build --release -p trieval-server
+
+      # ── Build WASM ───────────────────────────────────────────────────────────
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM
+        run: |
+          wasm-pack build crates/wasm \
+            --target web \
+            --out-dir ../../web/public/wasm \
+            --release
+
+      # ── Build frontend ───────────────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      # ── Run migrations ───────────────────────────────────────────────────────
+      - name: Run migrations
+        run: |
+          cargo install sqlx-cli \
+            --no-default-features --features rustls,postgres \
+            --quiet
+          sqlx migrate run --source migrations
+
+      # ── Start server ─────────────────────────────────────────────────────────
+      - name: Start trieval server
+        run: |
+          fuser -k "${PORT}/tcp" 2>/dev/null || true
+
+          STATIC_DIR="$(pwd)/web/dist" \
+          LISTEN_ADDR="0.0.0.0:${PORT}" \
+          RUST_LOG=info \
+            ./target/release/server \
+              > /tmp/trieval.log 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+
+          echo -n "Waiting for :${PORT}"
+          for i in $(seq 1 30); do
+            curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1 \
+              && echo " ✓ (${i}s)" && break
+            echo -n "." && sleep 1
+          done
+
+          STATUS=$(curl -so /dev/null -w "%{http_code}" "http://localhost:${PORT}/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Server did not start (HTTP $STATUS)"
+            cat /tmp/trieval.log
+            exit 1
+          fi
+          echo "✓ Server is up on :${PORT}"
+
+      # ── Tunnel: localtunnel ─────────────────────────────────────────────────
+      - name: Start localtunnel
+        if: env.TUNNEL == 'localtunnel'
+        run: |
+          npx --yes localtunnel --port "$PORT" > /tmp/tunnel.log 2>&1 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          echo -n "Waiting for localtunnel URL"
+          for i in $(seq 1 30); do
+            URL=$(grep -oP 'https://\S+' /tmp/tunnel.log | head -1 || true)
+            [ -n "$URL" ] && echo " ✓" && break
+            echo -n "." && sleep 1
+          done
+          [ -z "$URL" ] && echo "❌ localtunnel gave no URL" && cat /tmp/tunnel.log && exit 1
+          echo "PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+
+      # ── Tunnel: cloudflared ─────────────────────────────────────────────────
+      - name: Start cloudflared
+        if: env.TUNNEL == 'cloudflared'
+        run: |
+          if ! command -v cloudflared &>/dev/null; then
+            curl -fsSL \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o /tmp/cloudflared && chmod +x /tmp/cloudflared
+            sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          fi
+          cloudflared tunnel --url "http://localhost:${PORT}" \
+            --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          echo -n "Waiting for cloudflared URL"
+          for i in $(seq 1 40); do
+            URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
+            [ -n "$URL" ] && echo " ✓" && break
+            echo -n "." && sleep 1
+          done
+          [ -z "$URL" ] && echo "❌ cloudflared gave no URL" && cat /tmp/tunnel.log && exit 1
+          echo "PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+
+      # ── Tunnel: ngrok ───────────────────────────────────────────────────────
+      - name: Start ngrok
+        if: env.TUNNEL == 'ngrok'
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if ! command -v ngrok &>/dev/null; then
+            curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+              | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+            echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+              | sudo tee /etc/apt/sources.list.d/ngrok.list
+            sudo apt-get update -qq && sudo apt-get install -y ngrok
+          fi
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+          ngrok http "$PORT" --log=stdout --log-format=json > /tmp/tunnel.log 2>&1 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+          echo -n "Waiting for ngrok URL"
+          for i in $(seq 1 30); do
+            URL=$(grep -oP '"url":"https://[^"]+' /tmp/tunnel.log \
+              | head -1 | grep -oP 'https://[^"]+' || true)
+            [ -z "$URL" ] && URL=$(curl -sf http://localhost:4040/api/tunnels \
+              | grep -oP 'https://[0-9a-z.-]+\.ngrok[^"]+' | head -1 || true)
+            [ -n "$URL" ] && echo " ✓" && break
+            echo -n "." && sleep 1
+          done
+          [ -z "$URL" ] && echo "❌ ngrok gave no URL" && cat /tmp/tunnel.log && exit 1
+          echo "PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+
+      # ── 🔗 Вывод URL ────────────────────────────────────────────────────────
+      - name: "🔗 Открой в браузере"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║                                                              ║"
+          echo "║   Cell Triangulation Evaluator — Live Demo                  ║"
+          echo "║                                                              ║"
+          echo "║   Открой в браузере:                                         ║"
+          echo "║                                                              ║"
+          printf  "║   %-60s║\n" "$PUBLIC_URL"
+          echo "║                                                              ║"
+          printf  "║   Туннель: %-51s║\n" "$TUNNEL"
+          printf  "║   Живёт:   %-51s║\n" "~${DURATION} мин"
+          echo "║                                                              ║"
+          echo "║   Кликни на карте → триангуляция + метрики (CEP/GDOP)       ║"
+          echo "║   Загрузи OCI CSV через панель Sources                      ║"
+          echo "║                                                              ║"
+          echo "║   Jobs → Cancel workflow — чтобы остановить досрочно        ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+          ## 🗺️ Cell Triangulation Evaluator — Live Demo
+
+          | | |
+          |---|---|
+          | **URL** | [$PUBLIC_URL]($PUBLIC_URL) |
+          | **Туннель** | \`$TUNNEL\` |
+          | **Порт** | \`$PORT\` |
+          | **Живёт** | ~${DURATION} мин |
+
+          ### Как использовать
+          1. Открой ссылку выше
+          2. Кликни в любую точку на карте
+          3. Посмотри метрики: **CEP50**, **CEP95**, **GDOP**, эллипс ошибки
+          4. Загрузи OpenCelliD CSV через панель **Sources** для реальных данных
+
+          > Нажми **Cancel** в Actions когда закончишь — туннель закроется.
+          SUMMARY
+
+      # ── Ждём N минут ────────────────────────────────────────────────────────
+      - name: "⏳ Держу туннель ${{ github.event.inputs.duration || '30' }} мин…"
+        run: |
+          SECS=$(( DURATION * 60 ))
+          echo "Туннель активен. Автостоп через ${DURATION} мин или Cancel workflow."
+          # Печатаем статус каждые 5 минут пока ждём
+          ELAPSED=0
+          while [ "$ELAPSED" -lt "$SECS" ]; do
+            CHUNK=$(( SECS - ELAPSED ))
+            [ "$CHUNK" -gt 300 ] && CHUNK=300
+            sleep "$CHUNK"
+            ELAPSED=$(( ELAPSED + CHUNK ))
+            REMAINING=$(( (SECS - ELAPSED) / 60 ))
+            [ "$ELAPSED" -lt "$SECS" ] && \
+              echo "⏳ Прошло $((ELAPSED/60)) мин, осталось ~${REMAINING} мин  |  $PUBLIC_URL"
+          done
+          echo "✓ Время вышло, останавливаюсь."
+
+      # ── Cleanup ──────────────────────────────────────────────────────────────
+      - name: Cleanup
+        if: always()
+        run: |
+          [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null || true
+          [ -n "${TUNNEL_PID:-}" ] && kill "$TUNNEL_PID" 2>/dev/null || true
+          fuser -k "${PORT}/tcp" 2>/dev/null || true
+          echo "✓ Остановлено"
