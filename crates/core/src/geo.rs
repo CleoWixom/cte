@@ -77,9 +77,9 @@ mod tests {
 
     #[test]
     fn haversine_known() {
-        // Moscow Kremlin → Red Square ≈ 400 m
+        // Moscow Kremlin → Red Square ≈ 300 m (actual ~295 m)
         let d = haversine_m(55.7520, 37.6175, 55.7539, 37.6208);
-        assert!(d > 300.0 && d < 500.0, "d = {}", d);
+        assert!(d > 200.0 && d < 500.0, "d = {}", d);
     }
 
     #[test]

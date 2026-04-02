@@ -22,6 +22,7 @@ pub struct OciTower {
     #[serde(default)]
     pub samples: Option<i32>,
     #[serde(rename = "averageSignal", default)]
+    #[allow(dead_code)]
     pub avg_signal: i32,
 }
 
@@ -30,6 +31,7 @@ struct OciResponse {
     #[serde(default)]
     cells: Vec<OciTower>,
     #[serde(default)]
+    #[allow(dead_code)]
     total: Option<u32>,
 }
 
